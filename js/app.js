@@ -1,35 +1,306 @@
-// ---------- Data model and localStorage helpers ----------
-const STORAGE_KEY = 'medicycle_data_v1';
-const VERIFIED_KEY = 'medicycle_verified_profile'; // ADDED
+// js/app.js
+// MediCycle - IndexedDB (Option C) rewrite
+// Replace your old app.js with this file. UI unchanged.
 
-function defaultData(){
+// ---------- Old localStorage key used for migration reference ----------
+const LEGACY_STORAGE_KEY = 'medicycle_data_v1';
+const VERIFIED_KEY = 'medicycle_verified_profile'; // kept name for meta migration
+// NOTE: Verified key will be migrated into meta store as 'verifiedProfile'
+
+// ---------- IndexedDB service (db) ----------
+const db = (function(){
+  const DB_NAME = 'medicycle_db';
+  const DB_VERSION = 1;
+  const STORE_PROFILES = 'profiles';
+  const STORE_MEDICINES = 'medicines';
+  const STORE_HISTORY = 'history';
+  const STORE_META = 'meta';
+
+  let _db = null;
+
+  function open(){
+    return new Promise((resolve, reject) => {
+      if(_db) return resolve(_db);
+      const req = indexedDB.open(DB_NAME, DB_VERSION);
+      req.onupgradeneeded = (e) => {
+        const idb = e.target.result;
+        if(!idb.objectStoreNames.contains(STORE_PROFILES)){
+          idb.createObjectStore(STORE_PROFILES, { keyPath: 'id' });
+        }
+        if(!idb.objectStoreNames.contains(STORE_MEDICINES)){
+          const s = idb.createObjectStore(STORE_MEDICINES, { keyPath: 'id' });
+          s.createIndex('byProfile', 'profileId', { unique: false });
+        }
+        if(!idb.objectStoreNames.contains(STORE_HISTORY)){
+          const s = idb.createObjectStore(STORE_HISTORY, { keyPath: 'id' });
+          s.createIndex('byProfile', 'profileId', { unique: false });
+          s.createIndex('byMed', 'medId', { unique: false });
+        }
+        if(!idb.objectStoreNames.contains(STORE_META)){
+          idb.createObjectStore(STORE_META, { keyPath: 'key' });
+        }
+      };
+      req.onsuccess = (e) => {
+        _db = e.target.result;
+        resolve(_db);
+      };
+      req.onerror = (e) => reject(e.target.error);
+      req.onblocked = () => console.warn('DB open blocked');
+    });
+  }
+
+  function tx(storeNames, mode='readonly'){
+    return open().then(database => database.transaction(storeNames, mode));
+  }
+
+  // helpers
+  function getStoreAll(storeName){
+    return tx([storeName], 'readonly').then(t => {
+      return new Promise((res, rej) => {
+        const store = t.objectStore(storeName);
+        const req = store.getAll();
+        req.onsuccess = () => res(req.result || []);
+        req.onerror = () => rej(req.error);
+      });
+    });
+  }
+
+  function put(storeName, obj){
+    return tx([storeName], 'readwrite').then(t => {
+      return new Promise((res, rej) => {
+        const store = t.objectStore(storeName);
+        const req = store.put(obj);
+        req.onsuccess = () => res(req.result);
+        req.onerror = () => rej(req.error);
+      });
+    });
+  }
+
+  function getByKey(storeName, key){
+    return tx([storeName], 'readonly').then(t => {
+      return new Promise((res, rej) => {
+        const store = t.objectStore(storeName);
+        const req = store.get(key);
+        req.onsuccess = () => res(req.result);
+        req.onerror = () => rej(req.error);
+      });
+    });
+  }
+
+  function deleteKey(storeName, key){
+    return tx([storeName], 'readwrite').then(t => {
+      return new Promise((res, rej) => {
+        const store = t.objectStore(storeName);
+        const req = store.delete(key);
+        req.onsuccess = () => res();
+        req.onerror = () => rej(req.error);
+      });
+    });
+  }
+
+  function getIndexAll(storeName, indexName, query){
+    return tx([storeName], 'readonly').then(t => {
+      return new Promise((res, rej) => {
+        const store = t.objectStore(storeName);
+        const index = store.index(indexName);
+        const req = index.getAll(query);
+        req.onsuccess = () => res(req.result || []);
+        req.onerror = () => rej(req.error);
+      });
+    });
+  }
+
+  // Public API
   return {
-    profiles: [],
-    history: [],
-    currentProfileId: null
+    open: open,
+
+    // Profiles
+    async getProfiles(){
+      return getStoreAll(STORE_PROFILES);
+    },
+    async getProfile(id){
+      return getByKey(STORE_PROFILES, id);
+    },
+    async saveProfile(profile){
+      // profile must have id
+      await put(STORE_PROFILES, profile);
+      return profile;
+    },
+    async deleteProfile(id){
+      // delete profile, its medicines and history
+      await deleteKey(STORE_PROFILES, id);
+      // delete medicines for profile
+      const meds = await getIndexAll(STORE_MEDICINES, 'byProfile', id);
+      await Promise.all(meds.map(m => deleteKey(STORE_MEDICINES, m.id)));
+      // delete history for profile
+      const hist = await getIndexAll(STORE_HISTORY, 'byProfile', id);
+      await Promise.all(hist.map(h => deleteKey(STORE_HISTORY, h.id)));
+    },
+
+    // Medicines
+    async getMedicines(profileId){
+      if(!profileId) return [];
+      return getIndexAll(STORE_MEDICINES, 'byProfile', profileId);
+    },
+    async getMedicine(id){
+      return getByKey(STORE_MEDICINES, id);
+    },
+    async saveMedicine(med){
+      await put(STORE_MEDICINES, med);
+      return med;
+    },
+    async deleteMedicine(id){
+      await deleteKey(STORE_MEDICINES, id);
+    },
+
+    // History
+    async addHistory(entry){
+      // entry should get generated id
+      const obj = Object.assign({}, entry, { id: entry.id || ('hist_' + Math.random().toString(36).slice(2,9)) });
+      await put(STORE_HISTORY, obj);
+      return obj;
+    },
+    async getHistory(profileId){
+      if(!profileId) return [];
+      return getIndexAll(STORE_HISTORY, 'byProfile', profileId);
+    },
+    async clearHistoryForProfile(profileId){
+      const h = await getIndexAll(STORE_HISTORY, 'byProfile', profileId);
+      await Promise.all(h.map(item => deleteKey(STORE_HISTORY, item.id)));
+    },
+
+    // Meta (key-value)
+    async getMeta(key){
+      const r = await getByKey(STORE_META, key);
+      return r ? r.value : null;
+    },
+    async setMeta(key, value){
+      await put(STORE_META, { key, value });
+      return value;
+    },
+
+    // Export everything into a JSON object (compatible with previous localStorage shape)
+    async exportAll(){
+      const profiles = await getStoreAll(STORE_PROFILES);
+      // For each profile, include associated medicines as array on the profile object to match legacy shape
+      const medicines = await getStoreAll(STORE_MEDICINES);
+      const history = await getStoreAll(STORE_HISTORY);
+      const metaItems = await getStoreAll(STORE_META);
+      const meta = {};
+      metaItems.forEach(m => meta[m.key] = m.value);
+
+      // Convert into legacy-like structure:
+      // profiles (each with medicines array), history [...], currentProfileId from meta.currentProfileId
+      const profilesMap = {};
+      profiles.forEach(p => {
+        const copy = Object.assign({}, p);
+        copy.medicines = medicines.filter(m => m.profileId === p.id).map(m => {
+          const c = Object.assign({}, m);
+          // remove profileId from medicine as before (keeping simple)
+          delete c.profileId;
+          return c;
+        });
+        profilesMap[p.id] = copy;
+      });
+
+      const profilesArr = Object.values(profilesMap);
+      const exportObj = {
+        profiles: profilesArr,
+        history: history.map(h => {
+          // legacy history shape: { profileId, medId, medName, dosage, timeTakenISO }
+          const out = {
+            profileId: h.profileId,
+            medId: h.medId,
+            medName: h.medName,
+            dosage: h.dosage,
+            timeTakenISO: h.timeTakenISO,
+          };
+          // include id optionally
+          out.id = h.id;
+          return out;
+        }),
+        currentProfileId: meta.currentProfileId || null,
+        meta: meta
+      };
+      return exportObj;
+    },
+
+    // Import full JSON as produced by exportAll or legacy export
+    // Strategy: clear DB then insert data from JSON
+    async importAll(json){
+      // json expected shape: { profiles: [ {id, name, age, passkey, medicines:[...]} ], history: [...], currentProfileId }
+      // We'll clear stores and bulk-put items.
+      await open();
+      // Clearing by opening readwrite txs and using clear()
+      await new Promise((res, rej) => {
+        const t = _db.transaction([STORE_PROFILES, STORE_MEDICINES, STORE_HISTORY, STORE_META], 'readwrite');
+        t.objectStore(STORE_PROFILES).clear();
+        t.objectStore(STORE_MEDICINES).clear();
+        t.objectStore(STORE_HISTORY).clear();
+        t.objectStore(STORE_META).clear();
+        t.oncomplete = () => res();
+        t.onerror = () => rej(t.error);
+      });
+
+      // Insert profiles
+      const profiles = Array.isArray(json.profiles) ? json.profiles : [];
+      for(const p of profiles){
+        const pCopy = Object.assign({}, p);
+        // remove medicines from profile object before saving to profiles store
+        const medsForProfile = Array.isArray(pCopy.medicines) ? pCopy.medicines : [];
+        delete pCopy.medicines;
+        await put(STORE_PROFILES, pCopy);
+
+        // insert medicines
+        for(const m of medsForProfile){
+          // ensure medicine record has profileId so we can index it
+          const mCopy = Object.assign({}, m);
+          mCopy.profileId = pCopy.id;
+          if(!mCopy.id) mCopy.id = 'med_' + Math.random().toString(36).slice(2,9);
+          await put(STORE_MEDICINES, mCopy);
+        }
+      }
+
+      // Insert history
+      const hist = Array.isArray(json.history) ? json.history : [];
+      for(const h of hist){
+        const hCopy = Object.assign({}, h);
+        // ensure fields exist
+        if(!hCopy.id) hCopy.id = 'hist_' + Math.random().toString(36).slice(2,9);
+        await put(STORE_HISTORY, hCopy);
+      }
+
+      // Insert meta
+      const meta = json.meta || {};
+      if(json.currentProfileId) meta.currentProfileId = json.currentProfileId;
+      for(const k of Object.keys(meta)){
+        await put(STORE_META, { key: k, value: meta[k] });
+      }
+
+      return true;
+    },
+
+    // Clear entire DB (useful for resets)
+    async clearAll(){
+      await new Promise((res, rej) => {
+        const t = _db.transaction([STORE_PROFILES, STORE_MEDICINES, STORE_HISTORY, STORE_META], 'readwrite');
+        t.objectStore(STORE_PROFILES).clear();
+        t.objectStore(STORE_MEDICINES).clear();
+        t.objectStore(STORE_HISTORY).clear();
+        t.objectStore(STORE_META).clear();
+        t.oncomplete = () => res();
+        t.onerror = () => rej(t.error);
+      });
+    }
   };
-}
+})();
 
-function loadData(){
-  try{
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if(!raw) return defaultData();
-    return JSON.parse(raw);
-  }catch(e){ console.error('loadData', e); return defaultData(); }
-}
-
-function saveData(data){ localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); }
-
+// ---------- Utility functions ----------
 function uid(prefix='id'){
   return prefix + '_' + Math.random().toString(36).slice(2,9);
 }
 
-// Passkey verification persistence
-function setVerifiedProfile(id){ localStorage.setItem(VERIFIED_KEY, id); }
-function getVerifiedProfile(){ return localStorage.getItem(VERIFIED_KEY); }
-function clearVerified(){ localStorage.removeItem(VERIFIED_KEY); }
-
-// ---------- DOM refs ----------
+// ---------- DOM refs (unchanged) ----------
 const screenProfile = document.getElementById('screen-profile');
 const screenApp = document.getElementById('screen-app');
 const screenAdd = document.getElementById('screen-add');
@@ -43,7 +314,7 @@ const profileAgeEl = document.getElementById('profileAge');
 const profileIdEl = document.getElementById('profileId');
 
 const switchProfileBtn = document.getElementById('switchProfileBtn');
-const logoutBtn = document.getElementById('logoutBtn'); // ADDED
+const logoutBtn = document.getElementById('logoutBtn');
 const deleteProfileBtn = document.getElementById('deleteProfileBtn');
 
 const addMedicineBtn = document.getElementById('addMedicineBtn');
@@ -65,7 +336,7 @@ const toggleTheme = document.getElementById('toggleTheme');
 const exportBtn = document.getElementById('exportBtn');
 const importFile = document.getElementById('importFile');
 
-// Tabs
+// Tabs wiring (unchanged)
 document.querySelectorAll('#mainTabs .nav-link').forEach(a => {
   a.addEventListener('click', ()=>{
     document.querySelectorAll('#mainTabs .nav-link').forEach(x=>x.classList.remove('active'));
@@ -80,28 +351,67 @@ document.querySelectorAll('#mainTabs .nav-link').forEach(a => {
   });
 });
 
+// ---------- Application state ----------
+let currentProfile = null;
+let editingMedId = null;
+let notifiedSet = new Set();
+
+// ---------- Migration: from localStorage to IndexedDB (if present) ----------
+async function migrateFromLocalStorageIfNeeded(){
+  try{
+    // If DB already has profiles, skip migration
+    await db.open();
+    const existingProfiles = await db.getProfiles();
+    if(existingProfiles && existingProfiles.length>0) return;
+
+    const raw = localStorage.getItem(LEGACY_STORAGE_KEY);
+    if(!raw) return;
+    const parsed = JSON.parse(raw);
+    if(!parsed || !parsed.profiles) return;
+
+    // Ask user (non-modal environments may just auto-migrate) — we'll auto-import but leave localStorage intact.
+    console.info('Legacy localStorage data detected. Importing into IndexedDB...');
+    await db.importAll(parsed);
+
+    // preserve legacy VERIFIED_KEY as meta
+    const verified = localStorage.getItem(VERIFIED_KEY);
+    if(verified) await db.setMeta('verifiedProfile', verified);
+
+    // do not automatically remove legacy data; leave it so user can still Export/Import from old flow.
+    console.info('Migration complete. Legacy localStorage left intact for safety.');
+  }catch(err){
+    console.error('Migration failed', err);
+  }
+}
+
+// ---------- App init ----------
+(async function init(){
+  await db.open();
+  await migrateFromLocalStorageIfNeeded();
+  await initApp();
+})();
+
 // ---------- Profile creation / selection UI ----------
-function showCreateProfileForm(){
+async function showCreateProfileForm(){
   const name = prompt('Name:'); if(!name) return;
   const age = prompt('Age:'); if(!age) return;
   const passkey = prompt('Passkey:'); if(!passkey) return;
 
-  const data = loadData();
   const id = uid('profile');
-  data.profiles.push({ id, name, age, passkey, medicines: [] });
-  data.currentProfileId = id;
-  saveData(data);
+  const profileObj = { id, name, age, passkey };
+  await db.saveProfile(profileObj);
+  // save medicines later via medicine API (none right now)
+  await db.setMeta('currentProfileId', id);
+  await db.setMeta('verifiedProfile', id);
 
-  setVerifiedProfile(id); // mark as verified
-
-  initApp();
+  await initApp();
 }
 
-function renderProfiles(){
-  const data = loadData();
+async function renderProfiles(){
   profilesList.innerHTML = '';
 
-  if(data.profiles.length===0){
+  const profiles = await db.getProfiles();
+  if(!profiles || profiles.length===0){
     document.getElementById('no-data-screen').style.display='block';
     document.getElementById('select-profile-screen').style.display='none';
     return;
@@ -110,7 +420,7 @@ function renderProfiles(){
   document.getElementById('no-data-screen').style.display='none';
   document.getElementById('select-profile-screen').style.display='block';
 
-  data.profiles.forEach(p=>{
+  profiles.forEach(p=>{
     const div = document.createElement('div');
     div.className = 'd-flex align-items-center justify-content-between mb-2 card p-2';
 
@@ -129,82 +439,74 @@ function renderProfiles(){
 
   // SELECT PROFILE — passkey only here
   document.querySelectorAll('.select-profile').forEach(b=>{
-    b.addEventListener('click', ()=>{
+    b.addEventListener('click', async ()=>{
       const id = b.dataset.id;
-      const data = loadData();
-      const profile = data.profiles.find(x=>x.id===id);
+      const profile = await db.getProfile(id);
       if(!profile) return;
 
-      if(getVerifiedProfile() !== id){
+      const verified = await db.getMeta('verifiedProfile');
+      if(verified !== id){
         const pass = prompt(`Passkey for "${profile.name}":`);
         if(pass !== profile.passkey){
           alert("Wrong passkey");
           return;
         }
-        setVerifiedProfile(id);
+        await db.setMeta('verifiedProfile', id);
       }
 
-      data.currentProfileId = id;
-      saveData(data);
-      initApp();
+      await db.setMeta('currentProfileId', id);
+      await initApp();
     });
   });
 
   // DELETE PROFILE
   document.querySelectorAll('.delete-profile').forEach(b=>{
-    b.addEventListener('click', ()=>{
+    b.addEventListener('click', async ()=>{
       const id = b.dataset.id;
-      const data = loadData();
-      const profile = data.profiles.find(x=>x.id===id);
+      const profile = await db.getProfile(id);
 
       if(confirm(`Delete profile "${profile.name}"?`)){
-        data.profiles = data.profiles.filter(p=>p.id!==id);
-        data.history = data.history.filter(h=>h.profileId!==id);
+        await db.deleteProfile(id);
+        const verified = await db.getMeta('verifiedProfile');
+        if(verified === id) await db.setMeta('verifiedProfile', null);
+        const current = await db.getMeta('currentProfileId');
+        if(current === id) await db.setMeta('currentProfileId', null);
 
-        if(data.currentProfileId===id) data.currentProfileId = null;
-        if(getVerifiedProfile()===id) clearVerified();
-
-        saveData(data);
-        initApp();
+        await initApp();
       }
     });
   });
 }
-// ---------- App init / rendering ----------
-let data = loadData();
-let currentProfile = null;
-let editingMedId = null;
 
-function initApp(){
-  data = loadData();
-
-  // FIX: ALWAYS show profile list if no logged-in user
-  if(!data.currentProfileId){
+// ---------- App initialization / rendering ----------
+async function initApp(){
+  // load metadata currentProfileId
+  const curId = await db.getMeta('currentProfileId');
+  if(!curId){
+    // show profile list
     screenProfile.style.display='block';
     screenApp.style.display='none';
     screenAdd.style.display='none';
-    renderProfiles(); // <-- IMPORTANT FIX
+    await renderProfiles();
     return;
   }
 
-  // If logged-in profile exists → open directly (no passkey)
-  const profile = data.profiles.find(p=> p.id === data.currentProfileId);
+  const profile = await db.getProfile(curId);
   if(profile){
     currentProfile = profile;
-    openAppForProfile();
+    await openAppForProfile();
     return;
   }
 
-  // If stored profile id invalid, reset & show list
-  data.currentProfileId = null;
-  saveData(data);
+  // invalid stored id -> reset
+  await db.setMeta('currentProfileId', null);
   screenProfile.style.display='block';
   screenApp.style.display='none';
   screenAdd.style.display='none';
-  renderProfiles();
+  await renderProfiles();
 }
 
-function openAppForProfile(){
+async function openAppForProfile(){
   screenProfile.style.display='none';
   screenApp.style.display='block';
   screenAdd.style.display='none';
@@ -213,19 +515,25 @@ function openAppForProfile(){
   profileAgeEl.textContent = currentProfile.age;
   profileIdEl.textContent = currentProfile.id;
 
-  renderAll();
-  renderToday();
+  await renderAll();
+  await renderToday();
 }
 
 // ---------- Rendering ----------
-function renderAll(){
+async function renderAll(){
   medListAll.innerHTML = '';
-  if(!currentProfile || currentProfile.medicines.length===0){
+  if(!currentProfile){
     medListAll.innerHTML = '<div class="text-muted">No medicines added yet</div>';
     return;
   }
 
-  currentProfile.medicines.forEach(m=>{
+  const meds = await db.getMedicines(currentProfile.id);
+  if(!meds || meds.length===0){
+    medListAll.innerHTML = '<div class="text-muted">No medicines added yet</div>';
+    return;
+  }
+
+  meds.forEach(m=>{
     const card = document.createElement('div');
     card.className='card p-2 mb-2';
     card.innerHTML = `
@@ -247,12 +555,13 @@ function renderAll(){
   document.querySelectorAll('.del-med').forEach(b=> b.addEventListener('click', ()=> deleteMed(b.dataset.id)));
 }
 
-function renderToday(){
+async function renderToday(){
   medListToday.innerHTML = '';
   if(!currentProfile) return;
 
-  const today = new Date();
-  const todays = currentProfile.medicines.filter(m=> isMedicineForDate(m, today));
+  const now = new Date();
+  const meds = await db.getMedicines(currentProfile.id);
+  const todays = meds.filter(m=> isMedicineForDate(m, now));
 
   if(todays.length===0){
     medListToday.innerHTML = '<div class="text-muted">No medicines scheduled for today</div>';
@@ -260,30 +569,40 @@ function renderToday(){
   }
 
   todays.forEach(m=>{
-    const taken = wasTakenToday(currentProfile.id, m.id);
-
+    // wasTakenToday check uses history from DB
     const div = document.createElement('div');
     div.className='card p-2 mb-2 d-flex justify-content-between align-items-center';
+    // we'll check taken status asynchronously after building list to keep UI responsive
     div.innerHTML = `
       <div>
-        <div class="h6 mb-0">${m.name} ${taken? '<span class="badge bg-success ms-2">Taken</span>':''}</div>
+        <div class="h6 mb-0">${m.name} <span class="taken-badge-${m.id}"></span></div>
         <div class="small-muted">${m.dosage} • ${m.time} • ${m.food==='after'?'After Food':'Before Food'}</div>
       </div>
-      <button class="btn btn-sm btn-success mark-taken" data-id="${m.id}" ${taken?'disabled':''}>Mark taken</button>`;
+      <button class="btn btn-sm btn-success mark-taken" data-id="${m.id}">Mark taken</button>`;
 
     medListToday.appendChild(div);
   });
 
+  // attach handlers
   document.querySelectorAll('.mark-taken').forEach(b=> b.addEventListener('click', ()=> markTaken(b.dataset.id)));
+
+  // update badges by checking history
+  for(const m of todays){
+    const taken = await wasTakenToday(currentProfile.id, m.id);
+    const span = document.querySelector(`.taken-badge-${m.id}`);
+    if(span) span.innerHTML = taken ? '<span class="badge bg-success ms-2">Taken</span>' : '';
+    const btn = Array.from(document.querySelectorAll('.mark-taken')).find(x => x.dataset.id === m.id);
+    if(btn) btn.disabled = taken;
+  }
 }
 
-function renderHistory(){
+async function renderHistory(){
   historyList.innerHTML = '';
-  const data = loadData();
+  if(!currentProfile) return;
 
-  const list = data.history
-    .filter(h=> h.profileId === currentProfile.id)
-    .sort((a,b)=> new Date(b.timeTakenISO)-new Date(a.timeTakenISO));
+  const list = await db.getHistory(currentProfile.id);
+  // sort descending by timeTakenISO
+  list.sort((a,b) => new Date(b.timeTakenISO) - new Date(a.timeTakenISO));
 
   if(list.length===0){
     historyList.innerHTML = '<div class="text-muted">No history yet</div>';
@@ -308,10 +627,10 @@ function renderHistory(){
     .forEach(b=> b.addEventListener('click', ()=> navigator.clipboard.writeText(b.dataset.iso)));
 }
 
-// ---------- Helpers ----------
+// ---------- Helpers (same logic) ----------
 function cycleLabel(m){
   if(m.cycle==='daily') return 'Daily';
-  if(m.cycle==='monthly') return 'Monthly on '+ m.monthDay;
+  if(m.cycle==='monthly') return 'Monthly on '+ (m.monthDay || '?');
   if(m.cycle==='weekly') return 'Weekly on '+ (m.weekDays? m.weekDays.join(', '):'?');
   return '';
 }
@@ -331,15 +650,12 @@ function isMedicineForDate(m, date){
   return false;
 }
 
-function wasTakenToday(profileId, medId){
-  const d = loadData();
+async function wasTakenToday(profileId, medId){
+  const list = await db.getHistory(profileId);
   const today = (new Date()).toDateString();
-  return d.history.some(h=> 
-    h.profileId===profileId &&
-    h.medId===medId &&
-    new Date(h.timeTakenISO).toDateString()===today
-  );
+  return list.some(h=> h.profileId===profileId && h.medId===medId && new Date(h.timeTakenISO).toDateString()===today);
 }
+
 // ---------- Add/Edit/Delete medicine ----------
 function openAddMedicine(){
   editingMedId = null;
@@ -355,8 +671,8 @@ function openAddMedicine(){
   screenAdd.style.display='block';
 }
 
-function openEditMedicine(id){
-  const med = currentProfile.medicines.find(x=> x.id===id);
+async function openEditMedicine(id){
+  const med = await db.getMedicine(id);
   if(!med) return;
 
   editingMedId = id;
@@ -375,15 +691,12 @@ function openEditMedicine(id){
   screenAdd.style.display='block';
 }
 
-function deleteMed(id){
+async function deleteMed(id){
   if(!confirm('Delete this medicine?')) return;
 
-  const data = loadData();
-  const profile = data.profiles.find(p=> p.id===data.currentProfileId);
-  profile.medicines = profile.medicines.filter(m=> m.id!==id);
-
-  saveData(data);
-  initApp();
+  await db.deleteMedicine(id);
+  await renderAll();
+  await renderToday();
 }
 
 medCycle.addEventListener('change', ()=> renderCycleDetails());
@@ -419,9 +732,9 @@ function renderCycleDetails(med=null){
   }
 }
 
-medForm.addEventListener('submit', e=>{
+medForm.addEventListener('submit', async (e)=>{
   e.preventDefault();
-  saveMedicine();
+  await saveMedicine();
 });
 
 cancelMedBtn.addEventListener('click', ()=>{
@@ -429,21 +742,19 @@ cancelMedBtn.addEventListener('click', ()=>{
   screenApp.style.display='block';
 });
 
-function saveMedicine(){
+async function saveMedicine(){
   const name = medName.value.trim();
   const dosage = medDosage.value.trim();
   const time = medTime.value;
   const food = document.querySelector('input[name="food"]:checked').value;
   const cycle = medCycle.value;
 
-  const data = loadData();
-  const profile = data.profiles.find(p=> p.id===data.currentProfileId);
+  if(!currentProfile) { alert('No profile selected'); return; }
 
-  let medObj = editingMedId ? profile.medicines.find(m=> m.id===editingMedId) : null;
+  let medObj = editingMedId ? await db.getMedicine(editingMedId) : null;
 
   if(!medObj){
-    medObj = { id: uid('med'), name, dosage, time, food, cycle };
-    profile.medicines.push(medObj);
+    medObj = { id: uid('med'), profileId: currentProfile.id, name, dosage, time, food, cycle };
   } else {
     medObj.name = name;
     medObj.dosage = dosage;
@@ -454,36 +765,43 @@ function saveMedicine(){
 
   if(cycle==='monthly'){
     medObj.monthDay = Number(document.getElementById('monthDay').value);
+  } else {
+    delete medObj.monthDay;
   }
   if(cycle==='weekly'){
     medObj.weekDays = Array.from(document.querySelectorAll('.week-day:checked')).map(x=>x.value);
+  } else {
+    delete medObj.weekDays;
   }
 
-  saveData(data);
-  initApp();
+  await db.saveMedicine(medObj);
+  // ensure profile saved (in case newly created)
+  await db.saveProfile(currentProfile);
+
+  await initApp();
 }
 
 // ---------- Mark taken ----------
-function markTaken(medId){
-  const data = loadData();
-  const profile = data.profiles.find(p=> p.id===data.currentProfileId);
-  const med = profile.medicines.find(m=> m.id===medId);
+async function markTaken(medId){
+  if(!currentProfile) return;
+  const med = await db.getMedicine(medId);
+  if(!med) return;
 
-  data.history.push({
-    profileId: profile.id,
+  const entry = {
+    profileId: currentProfile.id,
     medId: med.id,
     medName: med.name,
     dosage: med.dosage,
     timeTakenISO: new Date().toISOString()
-  });
+  };
 
-  saveData(data);
-  renderToday();
+  await db.addHistory(entry);
+  await renderToday();
 }
 
-// ---------- Export / Import ----------
-exportBtn.addEventListener('click', ()=>{
-  const data = loadData();
+// ---------- Export / Import (now use db.exportAll / db.importAll) ----------
+exportBtn.addEventListener('click', async ()=>{
+  const data = await db.exportAll();
   const blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'});
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -505,11 +823,13 @@ importFile.addEventListener('change', async (e)=>{
 
     if(!imported.profiles) throw new Error('Invalid file');
 
-    if(confirm('This will replace current data. Proceed?')){
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(imported));
-      clearVerified(); // reset passkey state
+    if(confirm('This will replace current data in IndexedDB. Proceed?')){
+      await db.importAll(imported);
+      // clear verified and current
+      await db.setMeta('verifiedProfile', null);
+      await db.setMeta('currentProfileId', null);
       alert('Imported. Reloading view.');
-      initApp();
+      await initApp();
     }
 
   }catch(err){
@@ -520,55 +840,52 @@ importFile.addEventListener('change', async (e)=>{
 });
 
 // ---------- Notifications ----------
-let notifiedSet = new Set();
-
 function requestNotifPermission(){
   if('Notification' in window)
     Notification.requestPermission();
 }
 
-function checkReminders(){
+async function checkReminders(){
   const now = new Date();
   const hhmm = now.toTimeString().slice(0,5);
 
-  const data = loadData();
-  if(!data.currentProfileId) return;
+  const currentId = await db.getMeta('currentProfileId');
+  if(!currentId) return;
 
-  const profile = data.profiles.find(p=> p.id===data.currentProfileId);
+  const profile = await db.getProfile(currentId);
   if(!profile) return;
 
-  profile.medicines.forEach(m=>{
+  const meds = await db.getMedicines(profile.id);
+  for(const m of meds){
     if(m.time===hhmm && isMedicineForDate(m, now)){
       const key = `${profile.id}|${m.id}|${now.toDateString()}|${hhmm}`;
-      if(notifiedSet.has(key)) return;
-
+      if(notifiedSet.has(key)) continue;
       notifiedSet.add(key);
-
       if(Notification.permission==='granted'){
         new Notification(`MediCycle: ${m.name}`, {
           body: `${m.dosage} • ${m.food==='after'?'After Food':'Before Food'}`
         });
       }
     }
-  });
+  }
 }
 
 setInterval(checkReminders, 20000);
 
-// ---------- Theme ----------
-function applyTheme(isDark){
+// ---------- Theme (persisted in meta) ----------
+async function applyTheme(isDark){
   if(isDark) document.documentElement.classList.add('dark');
   else document.documentElement.classList.remove('dark');
-  localStorage.setItem('medicycle_theme', isDark? 'dark':'light');
+  await db.setMeta('theme', isDark? 'dark':'light');
 }
 
-toggleTheme.addEventListener('click', ()=>{
+toggleTheme.addEventListener('click', async ()=>{
   const isDark = document.documentElement.classList.toggle('dark');
-  localStorage.setItem('medicycle_theme', isDark? 'dark':'light');
+  await db.setMeta('theme', isDark? 'dark':'light');
 });
 
-(function(){
-  const t = localStorage.getItem('medicycle_theme');
+(async function(){
+  const t = await db.getMeta('theme');
   applyTheme(t==='dark');
 })();
 
@@ -577,44 +894,33 @@ createProfileBtn.addEventListener('click', showCreateProfileForm);
 addProfileBtn.addEventListener('click', showCreateProfileForm);
 
 // SWITCH PROFILE — full reset to list
-switchProfileBtn.addEventListener('click', ()=>{
-  const data = loadData();
-  data.currentProfileId = null;
-  saveData(data);
-  clearVerified();
+switchProfileBtn.addEventListener('click', async ()=>{
+  await db.setMeta('currentProfileId', null);
+  await db.setMeta('verifiedProfile', null);
   currentProfile = null;
-  initApp();
+  await initApp();
 });
 
 // LOGOUT FEATURE
-logoutBtn.addEventListener('click', ()=>{
-  const data = loadData();
-  data.currentProfileId = null;
-  saveData(data);
-  clearVerified();
+logoutBtn.addEventListener('click', async ()=>{
+  await db.setMeta('currentProfileId', null);
+  await db.setMeta('verifiedProfile', null);
   currentProfile = null;
-  initApp();
+  await initApp();
 });
 
 addMedicineBtn.addEventListener('click', openAddMedicine);
 
-// DELETE PROFILE
-deleteProfileBtn.addEventListener('click', ()=>{
+// DELETE PROFILE (current)
+deleteProfileBtn.addEventListener('click', async ()=>{
   if(!currentProfile) return;
 
   if(confirm(`Delete current profile "${currentProfile.name}"?`)){
-    const data = loadData();
-
-    data.profiles = data.profiles.filter(p=> p.id!==currentProfile.id);
-    data.history = data.history.filter(h=> h.profileId!==currentProfile.id);
-
-    data.currentProfileId = null;
-    saveData(data);
-
-    clearVerified();
+    await db.deleteProfile(currentProfile.id);
+    await db.setMeta('currentProfileId', null);
+    await db.setMeta('verifiedProfile', null);
     currentProfile = null;
-
-    initApp();
+    await initApp();
   }
 });
 
@@ -623,6 +929,3 @@ document.addEventListener('click', ()=>{
   if(Notification && Notification.permission==='default')
     requestNotifPermission();
 }, {once:true});
-
-// Initialize
-initApp();
